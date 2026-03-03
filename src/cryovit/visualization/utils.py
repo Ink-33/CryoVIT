@@ -32,11 +32,18 @@ def merge_experiments(
     results = []
 
     for exp_name, value in exp_names.items():
-        result_csv = exp_dir / f"{exp_name}.csv"
-        df = pd.read_csv(result_csv)
+        # Combine intermediate CSV files for each experiment
+        exp_results = []
+        exp_files = list((exp_dir / exp_name).glob("*.csv"))
+        for exp_file in exp_files:
+            df = pd.read_csv(exp_file)
+            exp_results.append(df)
+        exp_df = pd.concat(exp_results, axis=0, ignore_index=True)
+        exp_df.to_csv(exp_dir / f"{exp_name}.csv", index=False)  # Save combined experiment results
+        # Add experiment labels
         for key, val in zip(keys, value, strict=True):
-            df[key] = val
-        results.append(df)
+            exp_df[key] = val
+        results.append(exp_df)
 
     return pd.concat(results, axis=0, ignore_index=True)
 
@@ -68,7 +75,7 @@ def significance_test(
     score_B = df[df[key] == model_B].sort_values("tomo_name").dice_metric
     assert len(score_A) == len(
         score_B
-    ), "The two models must have the same number of samples for comparison."
+    ), f"The two models must have the same number of samples for comparison. {model_A} has {len(score_A)}, {model_B} has {len(score_B)}"
 
     if test_fn == "wilcoxon":
         _, pvalue = wilcoxon(

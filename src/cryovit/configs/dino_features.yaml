@@ -1,5 +1,5 @@
 # Path to the DINOv2 foundation model
-dino_dir: ${paths.model_dir}/${paths.dino_name}
+model_dir: ${paths.model_dir}/${paths.dino_name}
 
 # Sample to vectorize using DINOv2 (all samples)
 sample: null

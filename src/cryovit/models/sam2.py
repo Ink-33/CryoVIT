@@ -18,6 +18,7 @@ from sam2.modeling.sam2_base import SAM2Base
 from torch import Tensor
 from torch.optim import Optimizer
 
+from cryovit.config import SAM_IMAGE_SIZE
 from cryovit.config import BaseModel as BaseModelConfig
 from cryovit.models.base_model import BaseModel
 from cryovit.models.sam2_blocks import LoRAMaskDecoderFactory, PromptPredictor
@@ -29,15 +30,16 @@ if GlobalHydra.instance().is_initialized():
 
 ## Pre-trained Model Weights ##
 sam2_model = (
-    "facebook/sam2.1-hiera-tiny",
-    {"config": "sam2.1_hiera_t.yaml", "weights": "sam2.1_hiera_tiny.pt"},
-)  # the tiny variant of SAMv2.1
+    "facebook/sam2.1-hiera-large",
+    {"config": "sam2.1_hiera_l.yaml", "weights": "sam2.1_hiera_large.pt"},
+)  # the large variant of SAMv2.1
 medical_sam2_model = (
     "wanglab/MedSAM2",
     {"config": "sam2.1_hiera_t.yaml", "weights": "MedSAM2_latest.pt"},
 )  # fine-tuned on medical data SAMv2
 
 MAX_SAM_DEPTH = 255  # Temporary maximum depth (number of slices) for SAMv2 (due to implementation error in CUDA - https://github.com/pytorch/pytorch/issues/142228)
+MAX_BATCH_SIZE = 128  # Maximum batch size for SAMv2 image encoder if encountering memory issues
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
 
@@ -54,6 +56,10 @@ class SAM2(BaseModel):
         self.prompt_lr = custom_kwargs.get("prompt_lr", 3e-05)
         if "prompt_lr" in custom_kwargs:
             del custom_kwargs["prompt_lr"]
+        self.use_cache_features = custom_kwargs.get(
+            "use_cache_features", False
+        )
+        custom_kwargs["use_cache_features"] = self.use_cache_features
         self.model = sam_model(**custom_kwargs)
         self.prompt_predictor = PromptPredictor()
 
@@ -95,10 +101,10 @@ class SAM2(BaseModel):
     ) -> dict[str, Tensor]:
         """Override trainer _masked_predict to handle masking for the prompt predictor."""
 
-        out = self(batch)
         y_true = batch.labels  # (B, D, H, W)
-        y_pred_full, mask_pred_full = out["preds"], out["prompts"]
 
+        out = self(batch)
+        y_pred_full, mask_pred_full = out["preds"], out["prompts"]
         mask = (y_true > -1.0).detach()
         if use_mito_mask:
             assert (
@@ -130,13 +136,15 @@ class SAM2(BaseModel):
         """Override trainer do_step to handle losses for the prompt predictor."""
 
         out_dict = self._masked_predict(batch)
-
-        y_pred, y_true = out_dict["preds"], out_dict["labels"]
+        y_pred, y_true, masks = (
+            out_dict["preds"],
+            out_dict["labels"],
+            out_dict["masks"],
+        )
 
         losses = self.compute_losses(y_pred, y_true)
-        mask_loss = self.compute_losses(out_dict["masks"], y_true)["dice_loss"]
+        mask_loss = self.compute_losses(masks, y_true)["dice_loss"]
         losses["mask_loss"] = mask_loss
-        losses["total"] = losses["total"] + mask_loss
 
         for _, m_fn in self.metric_fns[prefix.upper()].items():  # type: ignore
             m_fn(y_pred, y_true)
@@ -179,6 +187,27 @@ class SAM2(BaseModel):
 
         return losses["total"]
 
+    def forward_features(
+        self, data: torch.Tensor
+    ) -> dict[str, list[torch.Tensor]]:
+        """Forward pass through the image encoder to extract features."""
+        b, d, c, h, w = data.shape
+        # Resize to SAM image size if needed
+        do_resize = self.model.image_size != h or self.model.image_size != w
+        if do_resize:
+            data = F.interpolate(
+                data,
+                size=(c, self.model.image_size, self.model.image_size),
+                mode="trilinear",
+                align_corners=False,
+            )
+        # Flatten batch
+        flat_data = data.reshape(
+            -1, c, self.model.image_size, self.model.image_size
+        )
+        backbone = self.model.image_encoder(flat_data)
+        return backbone
+
     def forward(self, data: BatchedTomogramData) -> dict[str, Tensor]:  # type: ignore
         C, H, W = data.tomo_batch.shape[-3:]  # [H, W]
         truncate_size = 0
@@ -208,22 +237,19 @@ class SAM2(BaseModel):
                 align_corners=False,
             )
 
-        flat_tensor = data.flat_tomo_batch  # [BxDxCxHxW] -> [[BxD]xCxHxW]
-        backbone_out = self.model.image_encoder(flat_tensor)
-        flat_box_prompts, flat_mask_prompts = self.prompt_predictor(
-            backbone_out["backbone_fpn"][0], num_batches=data.num_tomos
+        backbone = self.model._image_encoder(data)
+        box_prompts, mask_prompts = self.prompt_predictor(
+            backbone["backbone_fpn"][0], num_batches=data.num_tomos
         )  # flat tensor form
-        binary_flat_mask_prompts = (
-            flat_mask_prompts > 0.9
-        ).bool()  # binarize the mask prompts for SAM2 input conservatively
+        # Save predicted prompts for debugging/visualization
+        prompts = mask_prompts.view(
+            data.num_tomos, data.num_slices, *mask_prompts.shape[-2:]
+        ).detach()  # reshape to [B, D, H, W]
         preds = self.model(
-            data, flat_box_prompts, binary_flat_mask_prompts
-        )  # forward pass through SAM2
-        masks = flat_mask_prompts.view(
-            data.num_tomos, data.num_slices, *flat_mask_prompts.shape[-2:]
-        )  # reshape to [B, D, H, W]
+            data, box_prompts, mask_prompts
+        )  # forward pass through SAM
 
-        out = {"preds": preds, "prompts": masks}
+        out = {"preds": preds, "prompts": prompts}
 
         # Pad outputs if truncated
         if do_truncate:
@@ -260,15 +286,33 @@ class SAM2(BaseModel):
     def compile(self) -> None:
         """Compiles the model image encoder for training."""
 
-        self.model.image_encoder.forward = torch.compile(
-            self.model.image_encoder.forward
-        )
+        if not self.use_cache_features:
+            self.model.image_encoder.forward = torch.compile(
+                self.model.image_encoder.forward
+            )
         self.model.memory_encoder.forward = torch.compile(
             self.model.memory_encoder.forward
         )
         self.model.memory_attention.forward = torch.compile(
             self.model.memory_attention.forward
         )
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        """Override transfer_batch_to_device to handle moving SAM features to device."""
+        batch = super().transfer_batch_to_device(batch, device, dataloader_idx)
+        if batch.aux_data is not None and "sam_features" in batch.aux_data:
+            # ensure sam_features are also moved to device
+            for key in batch.aux_data["sam_features"]:
+                if isinstance(batch.aux_data["sam_features"][key], list):
+                    for i in range(len(batch.aux_data["sam_features"][key])):
+                        batch.aux_data["sam_features"][key][i] = (
+                            batch.aux_data["sam_features"][key][i].to(device)
+                        )
+                else:
+                    batch.aux_data["sam_features"][key] = batch.aux_data[
+                        "sam_features"
+                    ][key].to(device)
+        return batch
 
 
 class SAM2Train(SAM2Base):
@@ -281,6 +325,7 @@ class SAM2Train(SAM2Base):
         memory_encoder: nn.Module,
         num_init_cond_slices: tuple[int, int] = (1, 1),
         rand_init_cond_slices: tuple[bool, bool] = (True, False),
+        use_cache_features: bool = False,
         **kwargs,
     ) -> None:
         """Initializes the SAM2 model with pre-trained blocks."""
@@ -290,6 +335,7 @@ class SAM2Train(SAM2Base):
         )
         self.num_init_cond_slices = num_init_cond_slices
         self.rand_init_cond_slices = rand_init_cond_slices
+        self.use_cache_features = use_cache_features
 
     def _apply_lora_to_mask_decoder(self):
         """Delay applying LoRA to the mask decoder until after loading weights."""
@@ -299,31 +345,68 @@ class SAM2Train(SAM2Base):
         )  # Using alpha=r
         self.sam_mask_decoder = decoder_factory.apply(self.sam_mask_decoder)
 
-    def forward(
-        self, data: BatchedTomogramData, box_prompts, mask_prompts  # type: ignore
-    ) -> dict[str, Any] | Tensor:
+    def _image_encoder(
+        self, data: BatchedTomogramData  # type: ignore
+    ) -> dict[str, list[torch.Tensor]]:
+        """Either returns cached features from the tomogram batch or computes them using the image encoder."""
+        if self.use_cache_features:
+            assert (
+                data.aux_data is not None and "sam_features" in data.aux_data
+            ), "sam_features must be provided in aux_data to use cached features."
+            return data.aux_data["sam_features"]
+        try:
+            return self.image_encoder(data.flat_tomo_batch)
+        except torch.OutOfMemoryError:
+            logging.warning(
+                "MemoryError encountered in SAMv2 image encoder. Processing in smaller batches."
+            )
+            B = data.flat_tomo_batch.shape[0]
+            all_features = None
+            for start_idx in range(0, B, MAX_BATCH_SIZE):
+                end_idx = min(start_idx + MAX_BATCH_SIZE, B)
+                batch_features = self.image_encoder(
+                    data.flat_tomo_batch[start_idx:end_idx]
+                )
+                if all_features is None:
+                    all_features = {
+                        k: list(v) for k, v in batch_features.items()
+                    }
+                else:
+                    for k in all_features:
+                        for i in range(len(batch_features[k])):
+                            all_features[k][i] = torch.cat(
+                                [all_features[k][i], batch_features[k][i]],
+                                dim=0,
+                            )
+            return all_features
+
+    def forward(self, data: BatchedTomogramData, box_prompts: Tensor, mask_prompts: Tensor) -> dict[str, Any] | Tensor:  # type: ignore
         """Forward pass for the SAMv2 model."""
 
-        backbone_out = self.forward_image(data.flat_tomo_batch)
-        mid_slice_idx = data.num_slices // 2
+        backbone_out = self._image_encoder(data)
+        if self.use_high_res_features_in_sam:
+            # precompute projected level 0 and level 1 features in SAM decoder
+            # to avoid running it again on every SAM click
+            backbone_out["backbone_fpn"][0] = self.sam_mask_decoder.conv_s0(
+                backbone_out["backbone_fpn"][0]
+            )  # type: ignore
+            backbone_out["backbone_fpn"][1] = self.sam_mask_decoder.conv_s1(
+                backbone_out["backbone_fpn"][1]
+            )  # type: ignore
         backbone_out = self.prepare_prompt_inputs(
-            backbone_out,
-            box_prompts,
-            mask_prompts,
-            data,
-            start_slice_idx=mid_slice_idx,
+            backbone_out, data, box_prompts, mask_prompts
         )
         out = self.forward_tracking(backbone_out, data)
-        if not isinstance(out, dict):
+        if not isinstance(out, dict):  # if returning predictions
             out = torch.sigmoid(out)
         return out
 
     def prepare_prompt_inputs(
         self,
         backbone_out: dict[str, Any],
-        box_prompts: dict[str, Any],
-        mask_prompts: dict[str, Any],
         data: BatchedTomogramData,  # type: ignore
+        box_prompts: Tensor,
+        mask_prompts: Tensor,
         start_slice_idx: int = 0,
     ) -> dict[str, Any]:
         """Prepare predicted masks."""
@@ -359,10 +442,10 @@ class SAM2Train(SAM2Base):
             n for n in range(data.num_slices) if n not in init_cond_slices
         ]
 
-        # Prepare mask and box inputs for slices
+        # Prepare mask and box inputs for all slices
         backbone_out["box_inputs_per_slice"] = {}
         backbone_out["mask_inputs_per_slice"] = {}
-        for n in init_cond_slices:
+        for n in range(data.num_slices):
             idxs = data.index_to_flat_batch(n)
             backbone_out["box_inputs_per_slice"][n] = (
                 box_prompts[idxs] * self.sam_prompt_encoder.input_image_size[0]
@@ -414,7 +497,7 @@ class SAM2Train(SAM2Base):
                 feat_sizes=feat_sizes,
                 point_inputs=backbone_out["box_inputs_per_slice"].get(
                     slice_id, None
-                ),
+                ),  # point inputs are actually box inputs
                 mask_inputs=backbone_out["mask_inputs_per_slice"].get(
                     slice_id, None
                 ),
@@ -733,7 +816,7 @@ def create_sam_model_from_weights(cfg: BaseModelConfig, sam_dir: Path) -> SAM2:
         "cryovit.models.sam2.SAM2Train"  # Use cryovit SAM2 as target
     )
     model_cfg.image_size = (
-        512  # Set image size to 512 (crop size for training)
+        SAM_IMAGE_SIZE  # Set image size to 512 (crop size for training)
     )
     model_cfg.use_mask_input_as_output_without_sam = (
         False  # use sam memory and mask decoder

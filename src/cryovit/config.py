@@ -2,7 +2,7 @@
 
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +15,7 @@ samples: list[str] = [sample.name for sample in Sample]
 tomogram_exts: list[str] = [".hdf", ".mrc"]
 
 DINO_PATCH_SIZE = 14
-DEFAULT_WINDOW_SIZE = (
-    630  # Calculated assuming DINOv2 patch size of 14 and input size of 720
-)
+SAM_IMAGE_SIZE = 512
 
 
 @dataclass
@@ -60,6 +58,8 @@ class BaseTrainer:
         max_epochs (Optional[int]): The maximum number of epochs to train for.
         enable_checkpointing (bool): Flag to enable or disable model checkpointing. Default is False.
         enable_model_summary (bool): Enable model summarization. Default is True.
+        gradient_clip_val (Optional[float]): Value for gradient clipping. Default is None.
+        gradient_clip_algorithm (Optional[str]): Algorithm for gradient clipping. Default is None.
         log_every_n_steps (Optional[int]): Frequency of logging in terms of training steps.
     """
 
@@ -72,6 +72,8 @@ class BaseTrainer:
     max_epochs: int | None = None
     enable_checkpointing: bool = False
     enable_model_summary: bool = True
+    gradient_clip_val: float | None = None
+    gradient_clip_algorithm: str | None = None
     log_every_n_steps: int | None = None
 
 
@@ -136,19 +138,22 @@ class DinoFeaturesConfig:
 
     Attributes:
         batch_size (int): Number of tomogram slices to process as one batch. Default is 128.
-        dino_dir (Path): Path to the DINOv2 foundation model.
+        model_dir (Path): Path to the foundation model directory.
         paths (ExperimentPaths): Configuration for experiment paths.
         datamodule (dict[str, Any]): Configuration for the datamodule to use for loading tomograms.
         sample (Optional[Sample]): Sample to calculate features for. None means to calculate features for all samples.
         export_features (bool): Whether to additionally compute PCA colormaps for the calculated features.
+        use_sam (bool): Whether to compute SAMv2 image encodings instead of DINOv2 features.
     """
 
     batch_size: int = 128
-    dino_dir: Path = MISSING
+    model_dir: Path = MISSING
     paths: ExperimentPaths = MISSING
+    model: BaseModel | None = None
     datamodule: dict = MISSING
     sample: Sample | None = MISSING
     export_features: bool = False
+    use_sam: bool = False
 
 
 @dataclass
@@ -158,7 +163,7 @@ class BaseExperimentConfig:
     Attributes:
         name (str): Name of the experiment, should be unique for each configuration.
         label_key (str): Key used to specify the training labels.
-        additional_keys (tuple[str]): Keys to pass through additional data from the dataset.
+        additional_keys (list[str]): Keys to pass through additional data from the dataset.
         random_seed (int): Random seed set for reproducibility. Default is 42.
         paths (ExperimentPaths): Configuration for experiment paths.
         model (BaseModel): Configuration for the model to use.
@@ -172,7 +177,7 @@ class BaseExperimentConfig:
 
     name: str = MISSING
     label_key: str = MISSING
-    additional_keys: tuple[str] = ()  # type: ignore
+    additional_keys: list[str] = field(default_factory=list)
     random_seed: int = 42
     paths: ExperimentPaths = MISSING
     model: BaseModel = MISSING
