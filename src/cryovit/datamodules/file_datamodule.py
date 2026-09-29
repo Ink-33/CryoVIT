@@ -23,6 +23,7 @@ class FileDataModule(LightningDataModule):
         data_labels: list[Path] | None = None,
         val_labels: list[Path] | None = None,
         labels: list[str] | None = None,
+        load_aux_raw: bool = True,
         **kwargs,
     ) -> None:
         """Initializes the BaseDataModule with dataset parameters, a dataloader function, and a path to the split file.
@@ -48,6 +49,7 @@ class FileDataModule(LightningDataModule):
         )
         self.dataset_fn = dataset_fn
         self.dataloader_fn = dataloader_fn
+        self.load_aux_raw = load_aux_raw
 
     def _combine_files_and_labels(
         self,
@@ -119,7 +121,9 @@ class FileDataModule(LightningDataModule):
 
         if len(self.data_files) == 0:
             raise ValueError("No testing data provided.")
-        dataset = self.dataset_fn(self.data_files, train=False)
+        dataset = self.dataset_fn(
+            self.data_files, train=False, load_aux_raw=self.load_aux_raw
+        )
         return self.dataloader_fn(
             dataset, shuffle=False, collate_fn=collate_fn
         )
@@ -133,7 +137,9 @@ class FileDataModule(LightningDataModule):
 
         if len(self.data_files) == 0:
             raise ValueError("No prediction data provided.")
-        dataset = self.dataset_fn(self.data_files, train=False)
+        dataset = self.dataset_fn(
+            self.data_files, train=False, load_aux_raw=self.load_aux_raw
+        )
         return self.dataloader_fn(
             dataset, shuffle=False, collate_fn=collate_fn
         )

@@ -18,6 +18,7 @@ from cryovit.config import (
     tomogram_exts,
 )
 from cryovit.models import create_sam_model_from_weights
+from cryovit.perf_probe import probe_dump, probe_stage
 from cryovit.types import FileData
 from cryovit.visualization.dino_pca import export_pca
 
@@ -44,7 +45,6 @@ def _dino_features(
     Returns:
         NDArray[np.float16]: A numpy array containing the extracted features in reduced precision.
     """
-    data = data.cuda()
     w, h = (
         np.array(data.shape[-2:]) // 14
     )  # the number of patches extracted per slice
@@ -52,13 +52,16 @@ def _dino_features(
 
     for i in range(0, len(data), batch_size):
         # Check for overflows
-        if i + batch_size > len(data):
-            batch_size = len(data) - i
-        vec = data[i : i + batch_size]
-        features = model.forward_features(vec)["x_norm_patchtokens"]  # type: ignore
-        features = features.reshape(features.shape[0], w, h, -1)
-        features = features.permute([3, 0, 1, 2]).contiguous()
-        features = features.to("cpu").half().numpy()
+        end = min(i + batch_size, len(data))
+        # Upload per slice batch — never the full volume — so batch_size caps VRAM.
+        with probe_stage("dino.upload"):
+            vec = data[i:end].cuda()
+        with probe_stage("dino.forward"):
+            features = model.forward_features(vec)["x_norm_patchtokens"]  # type: ignore
+        with probe_stage("dino.d2h"):
+            features = features.reshape(features.shape[0], w, h, -1)
+            features = features.permute([3, 0, 1, 2]).contiguous()
+            features = features.to("cpu").half().numpy()
         all_features.append(features)
 
     return np.concatenate(all_features, axis=1)  # type: ignore
@@ -69,7 +72,7 @@ def _sam_features(
     data: torch.Tensor,
     model: torch.nn.Module,
     batch_size: int,
-) -> dict[str, list[NDArray[np.float32]]]:
+) -> dict[str, list[NDArray[np.float16]]]:
     """Extract patch features from a tomogram using a SAM model.
 
     Args:
@@ -78,32 +81,32 @@ def _sam_features(
         batch_size (int): The maximum number of 2D slices of a tomograms processed in each batch.
 
     Returns:
-        list[NDArray[np.float32]]: A list of numpy arrays containing the extracted features of different levels.
+        dict[str, list[NDArray[np.float16]]]: Per-level feature arrays (slice axis concatenated across batches).
     """
-    data = data.cuda()
-    all_features = {}
+    all_features: dict[str, list[list[NDArray[np.float16]]]] = {}
 
-    for i in range(0, len(data), batch_size):
+    for start in range(0, len(data), batch_size):
         # Check for overflows
-        if i + batch_size > len(data):
-            batch_size = len(data) - i
-        vec = data[i : i + batch_size]
-        backbone = model.forward_features(vec)  # type: ignore
+        end = min(start + batch_size, len(data))
+        # Upload per slice batch — never the full volume — so batch_size caps VRAM.
+        with probe_stage("sam.upload"):
+            vec = data[start:end].cuda()
+        with probe_stage("sam.forward"):
+            backbone = model.forward_features(vec)  # type: ignore
         for key, features in backbone.items():
             if key == "vision_features":
                 continue  # skip vision features (contained in backbone)
-            feature_list = []
-            for i, feature in enumerate(features):
-                feature = feature.to("cpu").half().numpy()
-                if len(feature_list) <= i:
-                    feature_list.append(feature)
-                else:
-                    feature_list[i] = np.concatenate(
-                        [feature_list[i], feature], axis=0
-                    )  # type: ignore
-            all_features[key] = feature_list
+            level_acc = all_features.setdefault(key, [[] for _ in range(len(features))])
+            for level_idx, feature in enumerate(features):
+                with probe_stage("sam.d2h"):
+                    level_acc[level_idx].append(feature.to("cpu").half().numpy())
 
-    return all_features
+    # Single concatenate per (key, level) — avoid O(n²) growth inside the loop.
+    with probe_stage("sam.concat"):
+        return {
+            key: [np.concatenate(level_batches, axis=0) for level_batches in levels]
+            for key, levels in all_features.items()
+        }
 
 
 def _save_data(
@@ -252,7 +255,14 @@ def run_dino(
     else:
         ## Load DINOv2 model
         torch.hub.set_dir(cfg.model_dir)
-        model = torch.hub.load(*dino_model, verbose=False).cuda()  # type: ignore
+        local_repo = Path(cfg.model_dir) / "facebookresearch_dinov2_main"
+        if local_repo.is_dir():
+            # Offline/container path: load from the vendored hubconf (no GitHub).
+            model = torch.hub.load(
+                str(local_repo), dino_model[1], source="local", verbose=False
+            ).cuda()
+        else:
+            model = torch.hub.load(*dino_model, verbose=False).cuda()  # type: ignore
         model.eval()
 
     ## Setup dataset
@@ -275,12 +285,19 @@ def run_dino(
             total=len(dataloader),
         ):
             feature_fn = _sam_features if use_sam else _dino_features
-            features = feature_fn(x.data, model, cfg.batch_size)
+            with probe_stage("features.total"):
+                features = feature_fn(x.data, model, cfg.batch_size)
 
             result_path = result_list[i].with_suffix(".hdf")
             result_path.parent.mkdir(parents=True, exist_ok=True)
-            result_dir, tomo_name = result_path.parent, result_path.name
-            _save_data(x.aux_data, features, tomo_name, result_dir)
+            tomo_name = result_path.name
+            with probe_stage("features.save"):
+                _save_data(x.aux_data, features, tomo_name, result_path.parent)
+            probe_dump(
+                result_dir / "perf_probe.jsonl",
+                case="sam" if use_sam else "dino",
+                tomo=tomo_name,
+            )
             if visualize:
                 assert isinstance(
                     features, np.ndarray
@@ -333,7 +350,14 @@ def run_trainer(cfg: DinoFeaturesConfig) -> None:
     else:
         ## Load DINOv2 model
         torch.hub.set_dir(cfg.model_dir)
-        model = torch.hub.load(*dino_model, verbose=False).cuda()  # type: ignore
+        local_repo = Path(cfg.model_dir) / "facebookresearch_dinov2_main"
+        if local_repo.is_dir():
+            # Offline/container path: load from the vendored hubconf (no GitHub).
+            model = torch.hub.load(
+                str(local_repo), dino_model[1], source="local", verbose=False
+            ).cuda()
+        else:
+            model = torch.hub.load(*dino_model, verbose=False).cuda()  # type: ignore
         model.eval()
 
     for sample_name in sample_names:

@@ -182,6 +182,32 @@ class BatchedTomogramData:
         slice_idxs = batch_ll + idx
         return slice_idxs.long()
 
+    def flat_idxs_by_slice(self) -> list[torch.Tensor]:
+        """One-pass map of every slice id to its flat-batch indices.
+
+        Reproduces ``index_to_flat_batch`` exactly (same packing rule: only
+        tomograms that contain the slice contribute, and their sizes are
+        prefix-summed among that subset) without per-slice ``argwhere``/``cumsum``.
+        Indices are packed into one CPU tensor and moved to the target device
+        once; the returned list holds views into that buffer. Result ``[i]``
+        matches ``index_to_flat_batch(i)``.
+        """
+        sizes = [int(s) for s in self.tomo_sizes.detach().cpu().tolist()]
+        device = self.tomo_sizes.device
+        flat: list[int] = []
+        lengths: list[int] = []
+        for slice_id in range(self.num_slices):
+            acc = 0
+            count = 0
+            for s in sizes:
+                if s > slice_id:
+                    flat.append(acc + slice_id)
+                    acc += s
+                    count += 1
+            lengths.append(count)
+        packed = torch.tensor(flat, dtype=torch.long, device=device)
+        return list(torch.split(packed, lengths, dim=0))
+
     @property
     def flat_tomo_batch(self) -> torch.Tensor:
         """Returns a [[BxD]xCxHxW] tensor from a [BxDxCxHxW] tensor (C is optional)."""
@@ -211,9 +237,9 @@ class BatchedModelResult:
     samples: list[str]
     tomo_names: list[str]
     split_id: list[int] | None
-    data: list[NDArray[np.float32]]
-    label: list[NDArray[np.uint8]]
-    preds: list[NDArray[np.float32]]
+    data: list[NDArray[np.float32] | None]
+    label: list[NDArray[np.uint8]] | None
+    preds: list[NDArray[np.float32] | Any]  # numpy or pending torch tensor
     losses: dict[str, float]
     metrics: dict[str, float]
     aux_data: dict[str, Any] | None = None

@@ -1,7 +1,9 @@
 _target_: torch.utils.data.DataLoader
 _partial_: True
-num_workers: 8
-prefetch_factor: 1
+# Conservative defaults for whole-tomogram samples; raise workers/prefetch
+# only after measuring peak RSS on target hardware.
+num_workers: 4
+prefetch_factor: 2
 persistent_workers: False
 pin_memory: True
 batch_size: 1

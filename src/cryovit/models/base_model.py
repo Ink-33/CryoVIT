@@ -11,6 +11,7 @@ from pytorch_lightning.utilities import grad_norm
 from torch import Tensor, nn
 from torch.optim import Optimizer
 
+from cryovit.perf_probe import probe_stage
 from cryovit.types import BatchedModelResult, BatchedTomogramData
 
 
@@ -251,12 +252,15 @@ class BaseModel(LightningModule, ABC):
             BatchedModelResult: Contains test results and metrics, as well as file metadata for this batch.
         """
 
-        assert (
-            batch.aux_data is not None and "data" in batch.aux_data
-        ), "Batch aux_data must contain 'data' key for prediction."
-        input_data = batch.aux_data["data"]
-        preds = self(batch)
-        labels = [t_labels.cpu().numpy() for t_labels in batch.labels]
+        input_data = (
+            batch.aux_data["data"]
+            if batch.aux_data is not None and "data" in batch.aux_data
+            else None
+        )
+        with probe_stage("infer.forward"):
+            preds = self(batch)
+        # Keep preds on their device until the writer; only metadata
+        # identifiers need a sync here.
         samples, tomo_names = batch.metadata.identifiers
 
         return BatchedModelResult(
@@ -264,9 +268,9 @@ class BaseModel(LightningModule, ABC):
             samples=samples,
             tomo_names=tomo_names,
             split_id=None,
-            data=input_data,
-            label=labels,
-            preds=[t_preds.float().cpu().numpy() for t_preds in preds],
+            data=input_data if input_data is not None else [None] * batch.num_tomos,
+            label=None,  # filled lazily by writer if needed
+            preds=preds,  # type: ignore[arg-type]  # tensors until write
             losses={},
             metrics={},
             aux_data=None,

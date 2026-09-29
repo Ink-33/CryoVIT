@@ -5,10 +5,12 @@ from typing import Any
 import h5py
 import numpy as np
 import pandas as pd
+import torch
 from pytorch_lightning import Callback, LightningModule, Trainer
 from pytorch_lightning.callbacks.prediction_writer import BasePredictionWriter
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 
+from cryovit.perf_probe import probe_stage
 from cryovit.types import BatchedModelResult
 
 
@@ -59,15 +61,29 @@ class TestPredictionWriter(Callback):
 
 
 class PredictionWriter(BasePredictionWriter):
-    """Callback to write predictions to disk during model prediction."""
+    """Callback to write predictions to disk during model prediction.
+
+    Writes overlap with compute on a single background thread (h5py is
+    process-global and not multi-writer safe). ``drain()`` must be called before
+    reading results; ``run_inference`` does this before returning.
+    """
 
     def __init__(
-        self, results_dir: Path, label_key: str, threshold: float, **kwargs
+        self,
+        results_dir: Path,
+        label_key: str,
+        threshold: float,
+        save_raw: bool = True,
+        max_queue: int = 2,
+        **kwargs,
     ) -> None:
         """Creates a callback to save predictions on the test data.
 
         Args:
             results_dir (Path): directory in which the predictions should be saved.
+            save_raw (bool): also write the raw volume as ``data`` (format-compatible
+                default). When False only ``{label_key}_preds`` is written.
+            max_queue (int): bounded number of in-flight write jobs.
         """
 
         super().__init__(write_interval="batch", **kwargs)
@@ -76,7 +92,85 @@ class PredictionWriter(BasePredictionWriter):
         )
         self.label_key = label_key
         self.threshold = threshold
+        self.save_raw = save_raw
         self.result_paths = []
+        self._max_queue = max_queue
+        self._in_flight = 0
+        self._errors: list[BaseException] = []
+        self._thread = None
+        self._queue = None
+
+    def _ensure_worker(self) -> None:
+        import queue
+        import threading
+
+        if self._thread is not None:
+            return
+        self._queue = queue.Queue(maxsize=self._max_queue)
+
+        def _worker():
+            while True:
+                job = self._queue.get()
+                if job is None:
+                    self._queue.task_done()
+                    return
+                result_path, data, segs = job
+                try:
+                    self._write_file(result_path, data, segs)
+                    self.result_paths.append(result_path)
+                except BaseException as exc:  # noqa: BLE001
+                    self._errors.append(exc)
+                finally:
+                    self._in_flight -= 1
+                    self._queue.task_done()
+
+        self._thread = threading.Thread(target=_worker, daemon=True, name="pred-writer")
+        self._thread.start()
+
+    @staticmethod
+    def _to_numpy(tensor) -> np.ndarray:
+        """Non-blocking GPU→CPU into a pinned buffer, then wait on an event."""
+        with probe_stage("infer.d2h"):
+            if not hasattr(tensor, "detach"):
+                return np.asarray(tensor)
+            t = tensor.detach()
+            if not t.is_cuda:
+                return t.cpu().numpy()
+            try:
+                pinned = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+                pinned.copy_(t, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record()
+                event.synchronize()
+                return pinned.numpy()
+            except Exception:
+                return t.cpu().numpy()
+
+    def _write_file(self, result_path: Path, data, segs) -> None:
+        segs = self._to_numpy(segs)
+        if data is not None:
+            data = self._to_numpy(data)
+        segs = (segs >= self.threshold).astype(np.uint8)
+        if data is not None:
+            data = data.astype(np.float32)
+        # h5py writes are serialized on this single worker thread on purpose.
+        with probe_stage("infer.write"):
+            with h5py.File(result_path, "w") as fh:
+                if self.save_raw and data is not None:
+                    fh.create_dataset("data", data=data, compression="gzip")
+                fh.create_dataset(
+                    f"{self.label_key}_preds", data=segs, compression="gzip"
+                )
+
+    def drain(self) -> None:
+        """Wait for all in-flight writes; re-raise the first background error."""
+        if self._queue is not None and self._thread is not None:
+            self._queue.join()
+            self._queue.put(None)
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        if self._errors:
+            raise self._errors[0]
 
     def write_on_batch_end(
         self,
@@ -88,25 +182,21 @@ class PredictionWriter(BasePredictionWriter):
         batch_idx: int,
         dataloader_idx: int,
     ) -> None:
-        """Handles the end of a prediction batch to save outputs."""
+        """Queue the end of a prediction batch for asynchronous save."""
 
+        if self._errors:
+            raise self._errors[0]
+        self._ensure_worker()
+        preds = prediction.preds
+        data_src = prediction.data
         for n in range(prediction.num_tomos):
             result_path = self.results_dir / prediction.tomo_names[n]
             result_path = result_path.with_suffix(".hdf")
             result_path.parent.mkdir(parents=True, exist_ok=True)
-            # Binary classify predictions into segmentations and convert to correct formats
-            data = prediction.data[n].astype(np.float32)
-            preds = prediction.preds[n]
-            segs = (preds >= self.threshold).astype(
-                np.uint8
-            )  # Binary segmentation
-            # Save data and pred to HDF5
-            with h5py.File(result_path, "w") as fh:
-                fh.create_dataset("data", data=data, compression="gzip")
-                fh.create_dataset(
-                    f"{self.label_key}_preds", data=segs, compression="gzip"
-                )
-            self.result_paths.append(result_path)
+            raw = data_src[n] if (self.save_raw and data_src is not None) else None
+            pred_n = preds[n]
+            self._in_flight += 1
+            self._queue.put((result_path, raw, pred_n))
 
 
 class CsvWriter(Callback):

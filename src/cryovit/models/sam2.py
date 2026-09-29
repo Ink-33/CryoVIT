@@ -481,8 +481,10 @@ class SAM2Train(SAM2Base):
             "cond_frame_outputs": {},
             "non_cond_frame_outputs": {},
         }
+        # One-pass prefix-sum map; loop body must not call index_to_flat_batch.
+        flat_idxs_list = data.flat_idxs_by_slice()
         for slice_id in processing_order:
-            flat_idxs = data.index_to_flat_batch(slice_id)
+            flat_idxs = flat_idxs_list[slice_id]
             # Get image features for the current slice
             current_vision_feats = [x[:, flat_idxs] for x in vision_feats]
             current_vision_pos_embeds = [

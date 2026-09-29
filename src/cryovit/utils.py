@@ -16,7 +16,12 @@ import torch
 from hydra.utils import instantiate
 
 from cryovit.config import BaseModel, tomogram_exts
-from cryovit.models.sam2 import create_sam_model_from_weights
+
+# Optional: SAM helpers only needed for SAM-backed models.
+try:
+    from cryovit.models.sam2 import create_sam_model_from_weights
+except ImportError:  # pragma: no cover
+    from cryovit.models import create_sam_model_from_weights
 from cryovit.types import ModelType
 
 #### General File Utilities ####
@@ -59,8 +64,24 @@ class FileMetadata:
     nunique: int = 0
 
 
+def _array_metadata(data: np.ndarray, compute_stats: bool) -> FileMetadata:
+    """Build FileMetadata. When compute_stats is False, skip min/max/unique scans."""
+    if not compute_stats:
+        return FileMetadata(
+            drange=(0.0, 0.0), dshape=data.shape, dtype=data.dtype, nunique=0
+        )
+    return FileMetadata(
+        drange=(float(np.min(data)), float(np.max(data))),
+        dshape=data.shape,
+        dtype=data.dtype,
+        nunique=int(len(np.unique(data))),
+    )
+
+
 def _read_hdf_keys(
-    hdf_file: h5py.File | h5py.Group, data_key: str | None = None
+    hdf_file: h5py.File | h5py.Group,
+    data_key: str | None = None,
+    compute_stats: bool = True,
 ) -> tuple[dict[str, np.ndarray], dict[str, FileMetadata]]:
     """Recursively read all keys in an HDF5 file or group, returning as a tuple of dictionaries of key: <data>/<metadata>. If a data_key is specified, only reads that key."""
 
@@ -70,25 +91,20 @@ def _read_hdf_keys(
     metadata_results = {}
     if data_key is not None:
         try:
-            data: np.ndarray = hdf_file[data_key][()]  # type: ignore
-            drange = (float(np.min(data)), float(np.max(data)))
-            dshape = data.shape
-            dtype = data.dtype
-            nunique = len(np.unique(data))
-            data_results[data_key] = data
-            metadata_results[data_key] = FileMetadata(
-                drange=drange, dshape=dshape, dtype=dtype, nunique=nunique
-            )
-            return data_results, metadata_results
+            data = hdf_file[data_key][()]  # type: ignore
         except KeyError:
-            logging.warning(
-                "Key %s not found in file %s. Attempting to read all keys instead.",
-                data_key,
-                hdf_file,
-            )
+            raise KeyError(
+                f"Key '{data_key}' not found in {getattr(hdf_file, 'file', hdf_file)}."
+                f" Top-level keys: {list(hdf_file.keys())}"
+            ) from None
+        data_results[data_key] = data
+        metadata_results[data_key] = _array_metadata(data, compute_stats)
+        return data_results, metadata_results
     for key in hdf_file:
         if isinstance(hdf_file[key], h5py.Group):
-            group_data_results, group_metadata_results = _read_hdf_keys(hdf_file[key])  # type: ignore
+            group_data_results, group_metadata_results = _read_hdf_keys(
+                hdf_file[key], compute_stats=compute_stats
+            )  # type: ignore
             data_results.update(
                 {f"{key}/{k}": v for k, v in group_data_results.items()}
             )
@@ -96,15 +112,9 @@ def _read_hdf_keys(
                 {f"{key}/{k}": v for k, v in group_metadata_results.items()}
             )
         elif isinstance(hdf_file[key], h5py.Dataset):
-            data: np.ndarray = hdf_file[key][()]  # type: ignore
-            drange = (float(np.min(data)), float(np.max(data)))
-            dshape = data.shape
-            dtype = data.dtype
-            nunique = len(np.unique(data))
+            data = hdf_file[key][()]  # type: ignore
             data_results[key] = data
-            metadata_results[key] = FileMetadata(
-                drange=drange, dshape=dshape, dtype=dtype, nunique=nunique
-            )
+            metadata_results[key] = _array_metadata(data, compute_stats)
         else:
             raise ValueError(
                 f"Unknown HDF5 object type found for key {key} in file {hdf_file.name}: {type(hdf_file[key])}."
@@ -113,29 +123,41 @@ def _read_hdf_keys(
 
 
 def read_hdf(
-    hdf_file: str | Path, key: str | None = None
+    hdf_file: str | Path,
+    key: str | None = None,
+    compute_stats: bool = True,
 ) -> tuple[str, np.ndarray, FileMetadata]:
     """Read data from an HDF5 file. If a key is not specified, assumes the data with the most unique values is the data.
 
     Args:
         hdf_file: The path to the HDF5 file.
-        key: The key to read from the HDF5 file. If None, assumes the data with the most unique values is the data. If not a valid key, will attempt to read all keys and use the one with the most unique values.
+        key: The key to read from the HDF5 file. If None, assumes the data with the
+            most unique values is the data. If the key is not present, raises KeyError.
+        compute_stats: When False, skip min/max/unique scans (nunique/drange unset).
 
     Returns:
         A tuple of the key used, the data, and the metadata.
     """
 
     with h5py.File(hdf_file, "r") as f:
-        data_dict, metadata_dict = _read_hdf_keys(f, data_key=key)
-    if key is None:
-        # Assume the data with the most unique values is the data
-        data_key = max(metadata_dict.items(), key=lambda x: x[1].nunique)[0]
-        logging.info(
-            "No key specified for file %s. Assuming data is the key with the most unique values, and using key '%s' with %d unique values. If this is incorrect, please specify the `data_key` manually as a `/`-separated string.",
-            hdf_file,
-            data_key,
-            metadata_dict[data_key].nunique,
+        data_dict, metadata_dict = _read_hdf_keys(
+            f, data_key=key, compute_stats=compute_stats
         )
+    if key is None:
+        if not data_dict:
+            raise ValueError(f"No datasets found in {hdf_file}.")
+        if compute_stats:
+            # Assume the data with the most unique values is the data
+            data_key = max(metadata_dict.items(), key=lambda x: x[1].nunique)[0]
+            logging.info(
+                "No key specified for file %s. Assuming data is the key with the most unique values, and using key '%s' with %d unique values. If this is incorrect, please specify the `data_key` manually as a `/`-separated string.",
+                hdf_file,
+                data_key,
+                metadata_dict[data_key].nunique,
+            )
+        else:
+            # Without stats, fall back to key order (heuristic needs nunique).
+            data_key = next(iter(data_dict))
     else:
         data_key = key
     data = data_dict[data_key]
@@ -143,44 +165,112 @@ def read_hdf(
     return data_key, data, metadata
 
 
-def read_mrc(mrc_file: str | Path) -> tuple[np.ndarray, FileMetadata]:
+def read_mrc(
+    mrc_file: str | Path, compute_stats: bool = True
+) -> tuple[np.ndarray, FileMetadata]:
     """Read data from an MRC file.
 
     Args:
         mrc_file: The path to the MRC file.
+        compute_stats: When False, skip min/max/unique scans.
 
     Returns:
         A tuple of the data and the metadata.
     """
 
     data: np.ndarray = mrcfile.read(mrc_file)
-    drange = (float(np.min(data)), float(np.max(data)))
-    dshape = data.shape
-    dtype = data.dtype
-    nunique = len(np.unique(data))
-    return data, FileMetadata(
-        drange=drange, dshape=dshape, dtype=dtype, nunique=nunique
-    )
+    return data, _array_metadata(data, compute_stats)
 
 
-def read_tiff(tiff_file: str | Path) -> tuple[np.ndarray, FileMetadata]:
+def read_tiff(
+    tiff_file: str | Path, compute_stats: bool = True
+) -> tuple[np.ndarray, FileMetadata]:
     """Read data from a TIFF file.
 
     Args:
         tiff_file: The path to the TIFF file.
+        compute_stats: When False, skip min/max/unique scans.
 
     Returns:
         A tuple of the data and the metadata.
     """
 
     data: np.ndarray = tf.imread(tiff_file)
-    drange = (float(np.min(data)), float(np.max(data)))
-    dshape = data.shape
-    dtype = data.dtype
-    nunique = len(np.unique(data))
-    return data, FileMetadata(
-        drange=drange, dshape=dshape, dtype=dtype, nunique=nunique
-    )
+    return data, _array_metadata(data, compute_stats)
+
+
+def read_hdf_window(
+    hdf_file: str | Path,
+    key: str,
+    window: tuple[slice, slice, slice],
+) -> np.ndarray:
+    """Read a D×H×W window from one HDF5 dataset without loading the full array.
+
+    ``window`` applies to the last three axes of the dataset (channel axis is
+    read in full when present).
+    """
+    with h5py.File(hdf_file, "r") as f:
+        ds = f[key]
+        if ds.ndim == 4:
+            data = ds[:, window[0], window[1], window[2]][()]
+        elif ds.ndim == 3:
+            data = ds[window[0], window[1], window[2]][()]
+        else:
+            raise ValueError(
+                f"Expected 3D or 4D dataset at '{key}', got shape {ds.shape}"
+            )
+    return data
+
+
+def load_labels_with_map(
+    file_path: str | Path,
+    label_keys: list[str],
+    key: str | None,
+    value_map: dict[int, int],
+) -> dict[str, np.ndarray]:
+    """Apply a precomputed global ``raw_value → class_id`` map to a label volume.
+
+    Used by windowed reads so a crop missing some foreground class still maps
+    consistently. ``value_map`` must be built from a full-volume scan or config
+    (never from a single crop).
+    """
+    file_path = Path(file_path)
+    if file_path.suffix in [".h5", ".hdf", ".hdf5"]:
+        _, data, _ = read_hdf(file_path, key=key, compute_stats=False)
+    elif file_path.suffix in [".mrc", ".mrcs"]:
+        data, _ = read_mrc(file_path, compute_stats=False)
+    elif file_path.suffix in [".tiff", ".tif"]:
+        data, _ = read_tiff(file_path, compute_stats=False)
+    else:
+        raise ValueError(f"Unsupported label format for {file_path}")
+
+    return apply_label_value_map(data, label_keys, value_map)
+
+
+def apply_label_value_map(
+    data: np.ndarray, label_keys: list[str], value_map: dict[int, int]
+) -> dict[str, np.ndarray]:
+    """Binarize labels using a global raw_value→class_id map.
+
+    ``value_map`` is ``{raw_volume_value: class_id}`` with ``class_id`` in
+    ``1..len(label_keys)`` matching the ascending ``label_keys`` order.
+    Ignore value ``-1`` is preserved. Built once from a full scan or config —
+    never from a single crop window.
+    """
+    labels = {
+        name: np.where(data == -1, -1, 0).astype(np.int8) for name in label_keys
+    }
+    for raw_val, class_id in value_map.items():
+        if not 1 <= class_id <= len(label_keys):
+            raise ValueError(
+                f"class_id {class_id} for raw value {raw_val} out of range "
+                f"1..{len(label_keys)}"
+            )
+        name = label_keys[class_id - 1]
+        labels[name] = np.where(
+            data == raw_val, 1, labels[name].astype(np.int8)
+        ).astype(np.int8)
+    return labels
 
 
 def load_data(
@@ -205,20 +295,24 @@ def load_data(
     if not file_path.exists():
         raise FileNotFoundError(f"File {file_path} does not exist.")
     if file_path.suffix in [".h5", ".hdf", ".hdf5"]:
-        found_key, data, metadata = read_hdf(file_path, key=key)
+        found_key, data, _ = read_hdf(file_path, key=key, compute_stats=False)
     elif file_path.suffix in [".mrc", ".mrcs"]:
-        data, metadata = read_mrc(file_path)
+        data, _ = read_mrc(file_path, compute_stats=False)
     elif file_path.suffix in [".tiff", ".tif"]:
-        data, metadata = read_tiff(file_path)
+        data, _ = read_tiff(file_path, compute_stats=False)
     else:
         raise ValueError(
             f"Unsupported file format for file {file_path}. Supported formats are .h5, .hdf, .hdf5, .mrc, .mrcs, .tiff, .tif, and image folders."
         )
 
-    # Assumed float data already normalized or are DINO features
-    if metadata.dtype in [np.uint8, np.int8, np.uint16, np.int16]:
-        # Normalize to [0, 1] and return as float32
+    # dtype rules apply to raw data only — not to labels (see load_labels).
+    if data.dtype == np.uint8:
+        # Normalize uint8 [0,255] to float32 [0,1]
         data = data.astype(np.float32) / 255.0
+    elif data.dtype in [np.int8, np.uint16, np.int16]:
+        # Convert to float32 but do NOT divide by 255
+        # int8 labels (-1,0,1) and uint16 instance masks must keep their values
+        data = data.astype(np.float32)
 
     if len(data.shape) == 3:
         data = data[np.newaxis, ...]  # add channel dimension
@@ -226,31 +320,38 @@ def load_data(
 
 
 def _match_label_keys_to_data(
-    data: np.ndarray, label_keys: list[str], metadata: FileMetadata
+    data: np.ndarray,
+    label_keys: list[str],
+    metadata: FileMetadata | None = None,
 ) -> dict[str, np.ndarray]:
-    """Match label keys to data based on the number of unique values in the data and the provided label keys. Assumes label_keys are in ascending-value order."""
+    """Match label keys to data based on the number of unique values in the data and the provided label keys. Assumes label_keys are in ascending-value order.
+
+    Scans ``np.unique(data)`` at most once. ``metadata`` is unused and kept only
+    for call-site compatibility.
+    """
 
     labels = {}
-    nunique = (
-        metadata.nunique if metadata.drange[0] >= 0 else metadata.nunique - 1
-    )  # ignore negative values for nunique count
+    uniques = np.unique(data)
+    unique_list = uniques.tolist()
+    has_neg_ignore = -1 in unique_list
+    # ignore negative values for nunique count
+    nunique = len(unique_list) - (1 if has_neg_ignore else 0)
+
     if nunique == len(label_keys):
-        label_values = sorted(np.unique(data).tolist())
-        for i, key in zip(label_values, label_keys, strict=True):
-            label = np.where((data != i) & (data != -1), 0, data)
-            labels[key] = np.where(label == i, 1, label).astype(np.int8)
-    elif nunique == len(label_keys) + 1 and 0 in np.unique(data):
+        label_values = sorted(x for x in unique_list if x != -1)
+    elif nunique == len(label_keys) + 1 and 0 in unique_list:
         logging.debug(
             "Assuming 0 is the background class in label data and hasn't been specified in label_keys."
         )
-        label_values = sorted([x for x in np.unique(data).tolist() if x > 0])
-        for i, key in zip(label_values, label_keys, strict=True):
-            label = np.where((data != i) & (data != -1), 0, data)
-            labels[key] = np.where(label == i, 1, label).astype(np.int8)
+        label_values = sorted(x for x in unique_list if x > 0)
     else:
         raise ValueError(
-            f"Number of unique values in label data ({metadata.nunique}) does not match number of provided label keys ({len(label_keys)})."
+            f"Number of unique values in label data ({len(unique_list)}) does not match number of provided label keys ({len(label_keys)})."
         )
+
+    for i, key in zip(label_values, label_keys, strict=True):
+        label = np.where((data != i) & (data != -1), 0, data)
+        labels[key] = np.where(label == i, 1, label).astype(np.int8)
     return labels
 
 
@@ -282,18 +383,21 @@ def load_labels(
         raise FileNotFoundError(f"File {file_path} does not exist.")
     labels = {}
     if file_path.suffix in [".h5", ".hdf", ".hdf5"]:
-        _, data, metadata = read_hdf(file_path, key=key)
         if len(label_keys) > 1:
-            labels_dict = _match_label_keys_to_data(data, label_keys, metadata)
-            labels.update(labels_dict)
+            # Multi-class mapping does its own single unique scan.
+            _, data, _ = read_hdf(file_path, key=key, compute_stats=False)
+            labels.update(_match_label_keys_to_data(data, label_keys))
         else:
+            # HDF5 single-label direct read: caller guarantees legal values
+            # ({0,1} or {-1,0,1}); no auto-detect, no extra scan.
+            _, data, _ = read_hdf(file_path, key=key, compute_stats=False)
             labels[key] = data.astype(np.int8)
     elif file_path.suffix in [".mrc", ".mrcs"]:
-        data, metadata = read_mrc(file_path)
-        labels.update(_match_label_keys_to_data(data, label_keys, metadata))
+        data, _ = read_mrc(file_path, compute_stats=False)
+        labels.update(_match_label_keys_to_data(data, label_keys))
     elif file_path.suffix in [".tiff", ".tif"]:
-        data, metadata = read_tiff(file_path)
-        labels.update(_match_label_keys_to_data(data, label_keys, metadata))
+        data, _ = read_tiff(file_path, compute_stats=False)
+        labels.update(_match_label_keys_to_data(data, label_keys))
     else:
         raise ValueError(
             f"Unsupported file format for file {file_path}. Supported formats are .h5, .hdf, .hdf5, .mrc, .mrcs, .tiff, .tif, and image folders."

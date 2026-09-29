@@ -115,12 +115,11 @@ class VITDataset(Dataset):
         ), f"Invalid height: {h} or width: {w}"
 
         np_data = np.expand_dims(data, axis=1)  # D, C, H, W (i.e., B, C, H, W)
-        np_data = np.repeat(np_data, 3, axis=1)
-
-        torch_data = torch.from_numpy(
-            np_data
-        ).float()  # data expected to be float already, [0-1]
-        return F.interpolate(torch_data, scale_factor=scale, mode="bicubic")
+        torch_data = torch.from_numpy(np_data).float()
+        torch_data = torch_data.expand(-1, 3, -1, -1)  # no 3× copy
+        return F.interpolate(
+            torch_data.contiguous(), scale_factor=scale, mode="bicubic"
+        )
 
     def _sam_transform(self, data: NDArray[np.float32]) -> torch.Tensor:
         """Applies normalization and resizing transformations to the tomogram for SAM model.
@@ -134,9 +133,6 @@ class VITDataset(Dataset):
 
         _, h, w = data.shape
         np_data = np.expand_dims(data, axis=(0, 2))  # B, D, C, H, W
-        np_data = np.repeat(np_data, 3, axis=2)
-
-        torch_data = torch.from_numpy(
-            np_data
-        ).float()  # data expected to be float already, [0-1]
+        torch_data = torch.from_numpy(np_data).float()
+        torch_data = torch_data.expand(-1, -1, 3, -1, -1)  # no 3× copy
         return torch_data

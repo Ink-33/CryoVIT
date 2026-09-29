@@ -13,15 +13,19 @@ from rich.progress import track
 from cryovit.config import tomogram_exts
 
 
-def _calculate_pca(features: NDArray[np.float16]) -> NDArray[np.float32]:
+def _calculate_pca(
+    features: NDArray[np.float16], pca_max_components: int = 1024
+) -> NDArray[np.float32]:
     from sklearn.decomposition import PCA
     from umap import UMAP
 
     float_features = features.astype(np.float32)  # type: ignore # PCA expects float32
     x = float_features.transpose((1, 2, 3, 0))
     x = x.reshape((-1, x.shape[-1]))  # N, C
-    # Reduce dimensionality to 3 colors
-    pca = PCA(n_components=min(1024, x.shape[0]))
+    # Reduce dimensionality to 3 colors. Default cap 1024 preserves existing look;
+    # lower caps change visualization appearance (opt-in only).
+    n_comp = min(pca_max_components, x.shape[0], x.shape[1])
+    pca = PCA(n_components=n_comp)
     x = pca.fit_transform(x)
     umap = UMAP(n_components=3, verbose=False, n_jobs=16)
     umap.fit(x)
@@ -66,6 +70,7 @@ def export_pca(
     tomo_name: str,
     result_dir: Path,
     frame_id: int | None = None,
+    pca_max_components: int = 1024,
 ) -> None:
     """Extract PCA colormap from features and save to a specified directory."""
 
@@ -80,14 +85,19 @@ def export_pca(
     else:
         idxs = [frame_id]
     np_features = features[:, idxs]
-    np_features = _calculate_pca(np_features)
+    np_features = _calculate_pca(
+        np_features, pca_max_components=pca_max_components
+    )
     np_features = _color_features(np_features)
+    # Normalize once outside the frame loop (was recomputed every frame).
+    data = data - data.min()
+    data_span = data.max()
+    if data_span > 0:
+        data = data / data_span
+    int_data = (data * 255.0).astype(np.uint8)
     for i, idx in enumerate(idxs):  # type: ignore
         img_path = image_dir / f"{idx}.png"
 
-        data = data - data.min()
-        data = data / data.max()
-        int_data = (data * 255.0).astype(np.uint8)
         f_img = Image.fromarray(np_features[i][::-1])
         d_img = Image.fromarray(int_data[idx][::-1])
 

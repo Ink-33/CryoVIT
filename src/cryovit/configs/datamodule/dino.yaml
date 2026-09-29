@@ -1,6 +1,7 @@
 dataloader:
-  num_workers: 0
-  prefetch_factor: null
+  # Feature extraction samples are whole tomograms — keep workers modest.
+  num_workers: 2
+  prefetch_factor: 1
   batch_size: null
 
 #### DO NOT MODIFY ####

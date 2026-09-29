@@ -1,6 +1,6 @@
-model_dir: /mnt/f/cryovit-data/foundation_models
-data_dir: /mnt/f/cryovit-data
-exp_dir: /mnt/f/cryovit-data/results
+model_dir: /opt/cryovit/weights/foundation_models
+data_dir: /data
+exp_dir: /work
 results_dir: ${paths.exp_dir}
 
 # tomo_name: ???

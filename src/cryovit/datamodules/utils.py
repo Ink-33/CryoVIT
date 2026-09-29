@@ -80,8 +80,12 @@ def collate_fn(batch: list[TomogramData]) -> BatchedTomogramData:  # type: ignor
             data = pad(
                 data, (0, 0, 0, 0, 0, padding), mode="constant", value=0
             )
+            # Bool label must be padded as float: bool pad value=-1 becomes True
             label = pad(
-                data, (0, 0, 0, 0, 0, padding), mode="constant", value=-1
+                label.to(torch.float),
+                (0, 0, 0, 0, 0, padding),
+                mode="constant",
+                value=-1,
             )  # ignore padding
         tomo_batch[tomo_idx] = data
         labels[tomo_idx] = label
