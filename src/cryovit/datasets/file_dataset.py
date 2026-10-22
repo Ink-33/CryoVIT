@@ -30,6 +30,8 @@ class FileDataset(Dataset):
         train: bool = False,
         for_dino: bool = False,
         use_sam: bool = False,
+        feat_noise_std: float = 0.0,
+        feat_gain_jitter: float = 0.0,
     ) -> None:
         """Creates a new FileDataset object.
 
@@ -48,6 +50,8 @@ class FileDataset(Dataset):
         self.train = train
         self.for_dino = for_dino
         self.use_sam = use_sam
+        self.feat_noise_std = float(feat_noise_std)
+        self.feat_gain_jitter = float(feat_gain_jitter)
 
         self.transform = Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD)
         self._key_cache = {}
@@ -110,10 +114,27 @@ class FileDataset(Dataset):
             sample=file_data.sample,
             tomo_name=file_data.tomo_path.name,
             split_id=None,
-            data=data["input"],
+            data=self._augment_features(data["input"]) if self.train else data["input"],
             label=data["label"],
             aux_data=aux_data,
         )  # type: ignore
+
+    def _augment_features(self, x):
+        """Train-time feature-space jitter: gain + Gaussian noise.
+
+        Proxy for contrast/dose variation when DINO features are precomputed.
+        """
+        if self.feat_gain_jitter <= 0 and self.feat_noise_std <= 0:
+            return x
+        if not torch.is_tensor(x):
+            return x
+        y = x.clone()
+        if self.feat_gain_jitter > 0:
+            g = 1.0 + (torch.rand((), device=y.device, dtype=y.dtype) * 2 - 1) * self.feat_gain_jitter
+            y = y * g
+        if self.feat_noise_std > 0:
+            y = y + torch.randn_like(y) * self.feat_noise_std
+        return y
 
     def _load_tomogram(self, file_data: FileData) -> dict[str, Any]:
         """Loads a single tomogram based on the file information.

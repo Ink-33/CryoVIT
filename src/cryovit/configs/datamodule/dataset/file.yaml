@@ -3,3 +3,6 @@ _partial_: True
 
 input_key: ${model.input_key}
 label_key: ${label_key}
+# train-time feature-space jitter (contrast-aug proxy)
+feat_noise_std: 0.0
+feat_gain_jitter: 0.0
